@@ -29,12 +29,13 @@ import org.apache.druid.query.lookup.namespace.CacheGenerator;
 import org.apache.druid.query.lookup.namespace.JdbcExtractionNamespace;
 import org.apache.druid.server.lookup.namespace.cache.CacheScheduler;
 import org.skife.jdbi.v2.DBI;
+import org.skife.jdbi.v2.Handle;
+import org.skife.jdbi.v2.ResultIterator;
 import org.skife.jdbi.v2.exceptions.UnableToObtainConnectionException;
 import org.skife.jdbi.v2.util.TimestampMapper;
 
 import javax.annotation.Nullable;
 import java.sql.Timestamp;
-import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -59,9 +60,9 @@ public final class JdbcCacheGenerator implements CacheGenerator<JdbcExtractionNa
   {
     final long lastCheck = lastVersion == null ? JodaUtils.MIN_INSTANT : Long.parseLong(lastVersion);
     final Long lastDBUpdate;
-    final List<Pair<String, String>> pairs;
+    final ResultIterator<Pair<String, String>> pairs;
     final long dbQueryStart;
-
+    final Handle handle;
     try {
       lastDBUpdate = lastUpdates(entryId, namespace);
       if (lastDBUpdate != null && lastDBUpdate <= lastCheck) {
@@ -69,8 +70,11 @@ public final class JdbcCacheGenerator implements CacheGenerator<JdbcExtractionNa
       }
       dbQueryStart = System.currentTimeMillis();
 
-      LOG.debug("Updating %s", entryId);
-      pairs = getLookupPairs(entryId, namespace);
+      LOG.info("Updating %s", entryId);
+      final DBI dbi = ensureDBI(entryId, namespace);
+      handle = dbi.open();
+
+      pairs = getLookupPairs(namespace, handle);
     }
     catch (UnableToObtainConnectionException e) {
       if (e.getMessage().contains("No suitable driver found")) {
@@ -92,9 +96,13 @@ public final class JdbcCacheGenerator implements CacheGenerator<JdbcExtractionNa
     final CacheScheduler.VersionedCache versionedCache = scheduler.createVersionedCache(entryId, newVersion);
     try {
       final Map<String, String> cache = versionedCache.getCache();
-      for (Pair<String, String> pair : pairs) {
-        cache.put(pair.lhs, pair.rhs);
+
+      while (pairs.hasNext()) {
+        Pair pair = pairs.next();
+
+        cache.put((String) pair.lhs, (String) pair.rhs);
       }
+
       LOG.info("Finished loading %d values for %s", cache.size(), entryId);
       return versionedCache;
     }
@@ -107,25 +115,25 @@ public final class JdbcCacheGenerator implements CacheGenerator<JdbcExtractionNa
       }
       throw t;
     }
+    finally {
+      pairs.close();
+      handle.close();
+    }
   }
 
-  private List<Pair<String, String>> getLookupPairs(
-      final CacheScheduler.EntryImpl<JdbcExtractionNamespace> key,
-      final JdbcExtractionNamespace namespace
+  private ResultIterator<Pair<String, String>> getLookupPairs(
+      final JdbcExtractionNamespace namespace,
+      final Handle handle
   )
   {
-    final DBI dbi = ensureDBI(key, namespace);
     final String table = namespace.getTable();
     final String filter = namespace.getFilter();
     final String valueColumn = namespace.getValueColumn();
     final String keyColumn = namespace.getKeyColumn();
 
-    return dbi.withHandle(
-        handle -> handle
-            .createQuery(buildLookupQuery(table, filter, keyColumn, valueColumn))
+    return handle.createQuery(buildLookupQuery(table, filter, keyColumn, valueColumn))
             .map((index, r, ctx) -> new Pair<>(r.getString(keyColumn), r.getString(valueColumn)))
-            .list()
-    );
+            .iterator();
   }
 
   private static String buildLookupQuery(String table, String filter, String keyColumn, String valueColumn)
